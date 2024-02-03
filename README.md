@@ -1,0 +1,1 @@
+For a description of the coordinate system, see https://www.redblobgames.com/grids/hexagons/
