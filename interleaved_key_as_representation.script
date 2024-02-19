@@ -1,0 +1,152 @@
+local camera = require 'orthographic.camera'
+local hex = require 'interleaved_key_as_representation'
+
+go.property('enabled', false)
+
+local function create_model(self)
+	local t = {
+		radius = 2,
+		ncs = {},
+		ecs = {},
+		nodes = {},
+		tiles = {},
+		edges = {},
+		borders = {},
+	}
+
+	hex.generate_grid(t.radius, function(nc, x, y)
+		t.ncs[#t.ncs + 1] = nc
+		t.nodes[nc] = {x = x, y = y, neighbors = {}}
+		t.tiles[nc] = {x = x, y = y, is_selected = false}
+	end)
+
+	for _, node in pairs(t.nodes) do
+		for i = 1, 6 do
+			local neighbor_x, neighbor_y = hex.neighbor(node.x, node.y, i)
+			local neighbor_nc = hex.create(neighbor_x, neighbor_y)
+			local is_valid = t.nodes[neighbor_nc] ~= nil
+			node.neighbors[i] = is_valid and neighbor_nc or false
+
+			local edge_x, edge_y = node.x + neighbor_x, node.y + neighbor_y
+			local ec = hex.create(edge_x, edge_y)
+			if not t.edges[ec] then
+				t.ecs[#t.ecs + 1] = ec
+
+				local half_axis = 3 - (i - 1) % 3
+				t.edges[ec] = {x = edge_x, y = edge_y, neighbors = {}, half_axis = half_axis}
+			end
+		end
+	end
+
+	for _, edge in pairs(t.edges) do
+		for i = 1, 4 do
+			local neighbor_x, neighbor_y = hex.edge_neighbor(edge.x, edge.y, edge.half_axis, i)
+			local neighbor_ec = hex.create(neighbor_x, neighbor_y)
+			local is_valid = t.edges[neighbor_ec] ~= nil
+			edge.neighbors[i] = is_valid and neighbor_ec or false
+		end
+	end
+
+	local origin_x, origin_y = 0, 1
+	local origin_ec = hex.create(origin_x, origin_y)
+	local origin_edge = t.edges[origin_ec]
+	t.borders[origin_ec] = {x = origin_x, y = origin_y}
+	for i = 1, 4 do
+		local dir_x, dir_y = hex.edge_direction(origin_edge.half_axis, i)
+		local edge_x, edge_y = origin_x + dir_x, origin_y + dir_y
+		local edge_ec = hex.create(edge_x, edge_y)
+		local edge = t.edges[edge_ec]
+		while edge do
+			t.borders[edge_ec] = {x = edge_x, y = edge_y, is_selected = false}
+			edge_x, edge_y = edge_x + dir_x, edge_y + dir_y
+			edge_ec = hex.create(edge_x, edge_y)
+			edge = t.edges[edge_ec]
+		end
+	end
+
+	return t
+end
+
+local function create_view(self)
+	local t = {
+		origin = {x = 0, y = 0},
+		size = {x = 74, y = 74},
+		tiles = {},
+		borders = {},
+	}
+
+	for nc, tile in pairs(self.model.tiles) do
+		local x, y = hex.center_point(tile.x, tile.y, t.origin, t.size)
+		local id = factory.create(self.tile_factory_url, vmath.vector3(x, y, 0))
+		local key_label_id = msg.url(nil, id, 'key_label')
+		local nc_label_id = msg.url(nil, id, 'nc_label')
+		label.set_text(key_label_id, nc)
+		label.set_text(nc_label_id, string.format('%d  %d  %d', tile.x, tile.y, -tile.x - tile.y))
+		t.tiles[nc] = id
+	end
+
+	local up_vector = vmath.vector3(0, 1, 0)
+	for ec, border in pairs(self.model.borders) do
+		local x, y = hex.center_point(border.x / 2, border.y / 2, t.origin, t.size)
+		local ax, ay, bx, by = hex.split(ec)
+		local dir_x, dir_y = hex.direction_vector(ax, ay, bx, by, t.size)
+		local rot = vmath.quat_from_to(up_vector, vmath.vector3(dir_x, dir_y, 0))
+		local id = factory.create(self.border_factory_url, vmath.vector3(x, y, 0), rot)
+		label.set_text(id, string.format('%d %d %d', border.x, border.y, -border.x - border.y))
+		t.borders[ec] = id
+	end
+
+	return t
+end
+
+function init(self)
+	if not self.enabled then return end
+	self.camera_hash = hash('/camera')
+	self.tile_factory_url = msg.url('#tile_factory')
+	self.border_factory_url = msg.url('#border_factory')
+	self.mouse_nc_url = msg.url('/mouse_nc')
+	self.mouse_ec_url = msg.url('/mouse_ec')
+	self.model = create_model(self)
+	self.view = create_view(self)
+	msg.post('.', 'acquire_input_focus')
+end
+
+function on_input(self, action_id, action)
+	if not self.enabled then return end
+	local mouse_pos = camera.screen_to_world(self.camera_hash, vmath.vector3(action.x, action.y, 0))
+	local x, y, z = hex.from_point(mouse_pos, self.view.origin, self.view.size)
+	label.set_text(self.mouse_nc_url, string.format('nc: %.3f, %.3f, %.3f', x, y, z))
+	label.set_text(self.mouse_ec_url, string.format('ec: %.3f, %.3f, %.3f', x * 2, y * 2, z * 2))
+
+	local ncx, ncy = hex.round(x, y, z)
+	local nc = hex.create(ncx, ncy)
+	if nc ~= self.selected_nc then
+		if self.selected_nc then
+			sprite.play_flipbook(self.view.tiles[self.selected_nc], 'tile')
+			self.model.tiles[self.selected_nc].is_selected = false
+		end
+		if self.model.tiles[nc] then
+			self.selected_nc = nc
+			sprite.play_flipbook(self.view.tiles[self.selected_nc], 'tile_selected')
+			self.model.tiles[nc].is_selected = true
+		else
+			self.selected_nc = nil
+		end
+	end
+
+	local ecx, ecy = hex.round(x * 2, y * 2, z * 2)
+	local ec = hex.create(ecx, ecy)
+	if ec ~= self.selected_ec then
+		if self.selected_ec then
+			sprite.play_flipbook(self.view.borders[self.selected_ec], 'border')
+			self.model.borders[self.selected_ec].is_selected = false
+		end
+		if self.model.borders[ec] then
+			self.selected_ec = ec
+			sprite.play_flipbook(self.view.borders[self.selected_ec], 'border_selected')
+			self.model.borders[ec].is_selected = true
+		else
+			self.selected_ec = nil
+		end
+	end
+end
